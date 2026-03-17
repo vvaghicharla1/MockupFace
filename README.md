@@ -108,7 +108,9 @@ Every product run generates 4 mockups across fixed condition slots:
 ```
 mockupface/
 ├── README.md
+├── ARCHITECTURE.md                Technical deep-dive
 ├── CONTRIBUTING.md
+├── CHANGELOG.md
 ├── LICENSE
 ├── .gitignore
 │
@@ -117,15 +119,35 @@ mockupface/
 │   ├── .env.example
 │   ├── schema.sql                 PostgreSQL + pgvector schema
 │   └── src/
-│       ├── main.rs                Server entry, router setup
-│       └── routes/
-│           ├── mod.rs             Shared types, embed() helper
-│           ├── ocr.rs             Tesseract OCR + Claude structuring
-│           ├── rag.rs             pgvector search + store
-│           ├── prompts.rs         Claude prompt generation
-│           ├── images.rs          DALL-E 3 image generation
-│           ├── qa.rs              GPT-4o Vision quality scoring
-│           └── pipeline.rs        Full 5-stage orchestrator
+│       ├── main.rs                Entry point — wires all layers, starts server
+│       │
+│       ├── common/                Shared foundation
+│       │   ├── constants.rs       Model names, URLs, thresholds, stage names
+│       │   ├── enums.rs           Platform, ConditionSlot, StageStatus, ProductType
+│       │   └── error.rs           AppError + AppResult — uniform error type
+│       │
+│       ├── models/                Domain structs (no logic)
+│       │   ├── mockup.rs          GeneratedPrompt, RagHit, QaResult, MockupResult
+│       │   ├── ocr.rs             OcrAnalysis
+│       │   └── pipeline.rs        PipelineStage, PipelineResponse
+│       │
+│       ├── controllers/           HTTP layer — parse requests, delegate, respond
+│       │   ├── ocr_controller.rs          POST /api/ocr
+│       │   ├── rag_controller.rs          POST /api/rag/search|store
+│       │   ├── prompts_controller.rs      POST /api/prompts
+│       │   ├── images_controller.rs       POST /api/generate-image
+│       │   ├── qa_controller.rs           POST /api/qa
+│       │   └── pipeline_controller.rs     POST /api/pipeline
+│       │
+│       ├── services/              Business logic — all AI and external API calls
+│       │   ├── http_service.rs    HttpService — shared HTTP client (Axum/Tokio)
+│       │   ├── ocr_service.rs     OcrService — Tesseract + Claude structuring
+│       │   ├── claude_service.rs  ClaudeService — Anthropic prompt generation
+│       │   ├── dalle_service.rs   DalleService — OpenAI DALL-E 3
+│       │   └── qa_service.rs      QaService — GPT-4o Vision scoring
+│       │
+│       └── repository/            Data access layer
+│           └── pgvector_repository.rs  PgvectorRepository — embed + search + store
 │
 └── frontend/                      React + Vite
     ├── index.html

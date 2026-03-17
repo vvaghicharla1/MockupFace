@@ -1,219 +1,279 @@
 # Architecture
 
-A technical deep-dive into how Mockupface is built.
+A technical deep-dive into Mockupface's layered backend design.
 
 ---
 
-## System Overview
-
-Mockupface is a two-process application:
-
-- **Backend** — Rust/Axum HTTP server handling all AI API calls, OCR, database, and pipeline orchestration
-- **Frontend** — React/Vite SPA that proxies `/api/*` requests to the backend in development, and talks directly to the backend in production
+## Layer Overview
 
 ```
-Browser (React)
-     │
-     │ /api/* (Vite proxy in dev, direct in prod)
-     ▼
-Rust/Axum Server :8080
-     │
-     ├── Tesseract OCR (subprocess)
-     ├── PostgreSQL + pgvector
-     ├── Anthropic API (Claude)
-     └── OpenAI API (DALL-E 3, GPT-4o, Embeddings)
+┌──────────────────────────────────────────────────────────────┐
+│                        HTTP Layer                            │
+│              Axum + Tokio  (HttpService)                     │
+├──────────────────────────────────────────────────────────────┤
+│                      Controllers                             │
+│   OcrController · RagController · PromptsController          │
+│   ImagesController · QaController · PipelineController       │
+├──────────────────────────────────────────────────────────────┤
+│                       Services                               │
+│   OcrService · ClaudeService · DalleService · QaService      │
+├──────────────────────────────────────────────────────────────┤
+│                      Repository                              │
+│                  PgvectorRepository                          │
+├──────────────────────────────────────────────────────────────┤
+│                       Common                                 │
+│        AppError · constants · enums · models                 │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Backend
-
-### Framework choices
-
-- **Axum** — ergonomic async Rust web framework built on top of Tokio and Tower. Chosen for its type-safe extractors and zero-cost middleware composition.
-- **Tokio** — async runtime. The pipeline runs 4 DALL-E 3 calls in parallel using `JoinSet`, which is only possible with async.
-- **sqlx** — compile-time verified SQL queries against PostgreSQL. No ORM overhead.
-- **pgvector** — Rust crate providing `Vector` type that maps directly to PostgreSQL's `vector` column type.
-
-### Route structure
-
-Each route is a single async function in its own file:
+## Directory Structure
 
 ```
-main.rs         → router setup, AppState (db pool + API keys)
-routes/
-  mod.rs        → shared types (GeneratedPrompt, RagHit), embed() helper
-  ocr.rs        → Tesseract subprocess + Claude structuring
-  rag.rs        → pgvector cosine search + store
-  prompts.rs    → Claude prompt generation
-  images.rs     → DALL-E 3 call
-  qa.rs         → GPT-4o Vision scoring
-  pipeline.rs   → orchestrates all 5 stages
+backend/src/
+├── main.rs                         Entry point — wires all layers, starts Axum server
+│
+├── common/
+│   ├── mod.rs
+│   ├── constants.rs                All magic strings — model names, URLs, thresholds
+│   ├── enums.rs                    Domain enumerations — Platform, ConditionSlot, etc.
+│   └── error.rs                   AppError + AppResult — uniform error type
+│
+├── models/
+│   ├── mod.rs
+│   ├── mockup.rs                  GeneratedPrompt, RagHit, QaResult, MockupResult
+│   ├── ocr.rs                     OcrAnalysis
+│   └── pipeline.rs                PipelineStage, PipelineResponse
+│
+├── controllers/                   HTTP handlers — parse requests, call services, return responses
+│   ├── mod.rs
+│   ├── ocr_controller.rs          POST /api/ocr
+│   ├── rag_controller.rs          POST /api/rag/search  POST /api/rag/store
+│   ├── prompts_controller.rs      POST /api/prompts
+│   ├── images_controller.rs       POST /api/generate-image
+│   ├── qa_controller.rs           POST /api/qa
+│   └── pipeline_controller.rs     POST /api/pipeline
+│
+├── services/                      Business logic — all AI and external API calls
+│   ├── mod.rs
+│   ├── http_service.rs            HttpService — shared Axum/reqwest HTTP client
+│   ├── ocr_service.rs             OcrService — Tesseract subprocess + Claude structuring
+│   ├── claude_service.rs          ClaudeService — Anthropic prompt generation
+│   ├── dalle_service.rs           DalleService — OpenAI DALL-E 3 generation
+│   └── qa_service.rs              QaService — GPT-4o Vision scoring
+│
+└── repository/
+    ├── mod.rs
+    └── pgvector_repository.rs     PgvectorRepository — embeddings + pgvector CRUD
 ```
 
-### State management
+---
 
-`AppState` is wrapped in `Arc` and shared across all handlers:
+## Common Layer
 
-```rust
-pub struct AppState {
-    pub db:            sqlx::PgPool,
-    pub anthropic_key: String,
-    pub openai_key:    String,
+### AppError (`common/error.rs`)
+
+Every handler and service returns `AppResult<T>` which is `Result<T, AppError>`.
+`AppError` implements `IntoResponse` — Axum serialises it automatically into a
+consistent JSON error body:
+
+```json
+{
+  "error":   "ANTHROPIC_ERROR",
+  "message": "Anthropic API error: model not found",
+  "detail":  null
 }
 ```
 
-API keys are read from environment at startup and never logged.
+Error variants map to HTTP status codes:
 
-### Parallel image generation
+| Variant                 | HTTP Status |
+|-------------------------|-------------|
+| `BadRequest`            | 400         |
+| `MissingField`          | 400         |
+| `NoImageProvided`       | 400         |
+| `UnsupportedPlatform`   | 400         |
+| `MissingApiKey`         | 401         |
+| All others              | 500         |
 
-The pipeline runs all 4 DALL-E 3 calls concurrently using Tokio's `JoinSet`:
+### Constants (`common/constants.rs`)
+
+Single source of truth for every magic string — model names, API base URLs,
+default values, stage names, thresholds. No hardcoded strings anywhere else.
 
 ```rust
-let mut set = JoinSet::new();
-for prompt in prompts {
-    let key = state.openai_key.clone();
-    set.spawn(async move {
-        call_dalle(&prompt, &key).await
-    });
-}
-while let Some(result) = set.join_next().await { ... }
+pub const CLAUDE_MODEL:     &str = "claude-sonnet-4-20250514";
+pub const DALLE_MODEL:      &str = "dall-e-3";
+pub const RAG_DEFAULT_TOP_K: i64 = 4;
+pub const QA_PASS_THRESHOLD: f64 = 0.6;
 ```
 
-This cuts image generation time from ~60s sequential to ~15s parallel.
+### Enums (`common/enums.rs`)
+
+All domain enumerations with behaviour attached:
+
+- `Platform` — `Etsy | Amazon` — carries `photography_guidelines()` and `qa_criteria()`
+- `ConditionSlot` — `C1–C4` — carries `label()`, `environment()`, `aesthetic_guidance()`
+- `StageStatus` — `Ok | Skipped | Error`
+- `ProductType` — `Mug | Tshirt | Poster | ...`
+- `ImageSize` / `ImageQuality` — DALL-E 3 parameter enums
 
 ---
 
-## pgvector RAG
+## Controllers Layer
 
-### Schema
+Controllers are thin. Their only responsibilities are:
+
+1. Parse and validate the incoming HTTP request
+2. Call the appropriate service(s)
+3. Map the result to an HTTP response
+
+No business logic. No direct database access. No direct API calls.
+
+```rust
+// Example — PromptsController
+pub async fn handle(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PromptsRequest>,
+) -> AppResult<Json<PromptsResponse>> {
+
+    if req.product_description.trim().is_empty() {
+        return Err(AppError::MissingField("product_description".into()));
+    }
+
+    let prompts = state.claude_service
+        .generate_prompts(...)
+        .await?;
+
+    Ok(Json(PromptsResponse { prompts, rag_used }))
+}
+```
+
+---
+
+## Services Layer
+
+### HttpService (`services/http_service.rs`)
+
+Central HTTP client used by all services — no raw `reqwest` calls elsewhere.
+Handles:
+- Connection pooling (`pool_max_idle_per_host = 10`)
+- Header injection per vendor (Anthropic key, OpenAI Bearer token)
+- Unified error extraction from API response bodies
+
+```rust
+// All services receive an HttpService and call through it
+let data = self.http.post_anthropic("/messages", api_key, &body).await?;
+let data = self.http.post_openai("/embeddings", api_key, &body).await?;
+```
+
+### OcrService
+
+Runs Tesseract as a subprocess via `std::process::Command`, writes bytes
+to a named temp file, reads the output `.txt` file, then calls Claude to
+structure the raw text into an `OcrAnalysis`.
+
+### ClaudeService
+
+Builds the prompt generation system prompt (platform tips + condition slot
+definitions + RAG context injection) and calls `HttpService.post_anthropic`.
+Deserialises the JSON response into `Vec<GeneratedPrompt>`.
+
+### DalleService
+
+Single-responsibility: call DALL-E 3 for one image. Appends negative prompt
+as an "Avoid:" clause (DALL-E 3 has no native negative parameter). Cloneable
+so pipeline can fan-out 4 parallel calls via `JoinSet`.
+
+### QaService
+
+Sends image URL + review prompt to GPT-4o Vision. Overrides the model's own
+`passed` field with a hard threshold check against `QA_PASS_THRESHOLD = 0.6`.
+
+---
+
+## Repository Layer
+
+### PgvectorRepository (`repository/pgvector_repository.rs`)
+
+All database operations in one place:
+
+**`embed(text, api_key)`** — calls OpenAI `text-embedding-3-small`, returns
+`Vec<f32>` (1536 dimensions).
+
+**`search_similar(query, platform, top_k, api_key)`** — embeds the query,
+runs a pgvector cosine similarity search against `rag_candidates` view
+(filtered for `qa_score >= 0.7`), returns `Vec<RagHit>`.
+
+**`store_run(...)`** — builds a composite embed string
+`"{product} | {label} | {env} | {prompt}"`, embeds it, inserts the full
+`mockup_runs` record with the vector.
 
 ```sql
-CREATE TABLE mockup_runs (
-    id          UUID PRIMARY KEY,
-    product_text TEXT,
-    platform    TEXT,
-    condition_id TEXT,
-    prompt_text TEXT,
-    image_url   TEXT,
-    qa_score    FLOAT,
-    embedding   vector(1536)   -- text-embedding-3-small
-);
-
-CREATE INDEX ON mockup_runs
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
-```
-
-### Embedding strategy
-
-The embedding is built from a composite string combining product text, condition label, environment, and the generated prompt. This ensures retrieval matches on the full semantic context, not just the product name:
-
-```
-"{product_text} | {condition_label} | {environment} | {prompt_text}"
-```
-
-### Retrieval
-
-Cosine similarity search filtered by platform:
-
-```sql
+-- Cosine similarity query
 SELECT *, 1 - (embedding <=> $1::vector) AS similarity
 FROM rag_candidates
 WHERE platform = $2 AND embedding IS NOT NULL
 ORDER BY embedding <=> $1::vector
-LIMIT 4
+LIMIT $3
 ```
 
-The `rag_candidates` view filters for `qa_score >= 0.7` and `user_rating >= 3`, ensuring only high-quality past runs are used as context.
+The `IVFFlat` index (100 lists) keeps similarity search sub-millisecond
+at scale.
 
 ---
 
-## Frontend
+## PipelineController — Full Orchestration
 
-### Two modes
+`PipelineController` is the only place that combines all layers. It:
 
-The app supports two runtime modes, toggled in the header:
+1. Parses multipart form data
+2. Calls `OcrService` if an image was uploaded
+3. Calls `PgvectorRepository.search_similar` for RAG context
+4. Calls `ClaudeService.generate_prompts`
+5. Fans out 4× `DalleService.generate` calls via `tokio::task::JoinSet`
+6. For each result calls `QaService.score`
+7. Stores passing runs via `PgvectorRepository.store_run`
+8. Returns `PipelineResponse` with stage log + mockup results
 
-**Backend mode** (default): All pipeline stages run on the Rust server. The frontend submits a multipart form to `/api/pipeline` and receives the full result.
-
-**Frontend mode** (fallback): Claude prompt generation and DALL-E 3 run directly from the browser using the user's API keys. OCR, RAG, and QA are skipped.
-
-### Canvas renderer
-
-When DALL-E 3 images aren't available (no OpenAI key, or frontend mode), the app renders placeholder mockup scenes using the HTML5 Canvas API. The canvas renderer in `canvasRenderer.js`:
-
-1. Draws a gradient background using the AI-generated `bg_from`/`bg_to` colors
-2. Renders a subtle grid texture
-3. Composites the uploaded product image onto a rounded product shape
-4. Applies a condition-specific tint overlay
-5. Renders condition badge, mood tags, and environment label
-
-### Key security
-
-API keys are stored only in React `useState`. They are:
-- Never written to `localStorage`, `sessionStorage`, or cookies
-- Never logged or sent to the Mockupface backend (in frontend mode, calls go directly to OpenAI/Anthropic)
-- Cleared automatically when the browser tab closes
+Each stage's outcome is captured in a `PipelineStage` record regardless of
+success or failure — the pipeline continues through non-fatal errors.
 
 ---
 
-## OCR Pipeline
+## AppState — Dependency Injection
 
-Tesseract runs as a subprocess via `std::process::Command`:
+All services and the repository are instantiated once in `main.rs` and
+shared via `Arc<AppState>`:
 
 ```rust
-Command::new("tesseract")
-    .args([&in_path, &out_base, "--oem", "3", "--psm", "3"])
-    .output()?
+pub struct AppState {
+    pub anthropic_key:  String,
+    pub openai_key:     String,
+    pub ocr_service:    OcrService,
+    pub claude_service: ClaudeService,
+    pub dalle_service:  DalleService,
+    pub qa_service:     QaService,
+    pub repository:     PgvectorRepository,
+}
 ```
 
-The raw OCR text is then passed to Claude with a structured extraction prompt, which returns JSON with:
-- `detected_text` — array of text strings found on the product
-- `font_hint` — apparent font style
-- `color_hint` — dominant color palette
-- `product_type` — mug, tshirt, poster, etc.
-- `summary` — 2-sentence description for DALL-E prompt generation
+All services share a single `HttpService` instance (and its connection pool)
+via `clone()` — `HttpService` wraps `reqwest::Client` which is cheaply
+cloneable by design.
 
 ---
 
-## AI Prompt Design
+## Error Propagation
 
-### Claude system prompt structure
-
-The Claude prompt generation system prompt encodes:
-1. Platform-specific photography guidelines (Etsy vs Amazon)
-2. The 4 condition slot definitions with aesthetic guidance
-3. Instructions to use RAG context from past runs
-4. Strict JSON output format with all required fields
-
-### RAG context injection
-
-Past similar runs are formatted and injected as numbered examples:
+The `?` operator is used throughout — errors bubble up from repository →
+service → controller and are converted to HTTP responses at the Axum boundary
+via `AppError`'s `IntoResponse` implementation. No `.unwrap()` in production
+paths.
 
 ```
-Past run #1 (similarity 0.91, condition c1):
-"Professional product photography, minimalist mug on marble..."
-→ QA score: 0.87
-
-Past run #2 (similarity 0.84, condition c2):
-...
+PgvectorRepository::store_run  →  AppError::DatabaseError
+      ↓ ?
+PipelineController::handle     →  AppError::IntoResponse → HTTP 500 JSON
 ```
-
-Claude uses these as reference for what produces high-scoring results on this platform.
-
----
-
-## Database
-
-### Connection pooling
-
-sqlx manages a pool of PostgreSQL connections. The pool is initialized at startup and shared via `AppState`:
-
-```rust
-let pool = sqlx::PgPool::connect(&database_url).await?;
-```
-
-### Migrations
-
-Schema is managed via a single `schema.sql` file. For production, this would be replaced with sqlx migrations (`sqlx migrate run`).
